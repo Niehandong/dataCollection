@@ -74,8 +74,10 @@ cdp-proxy.mjs 绕开了这一点：
 import json
 import random
 import re
+import sqlite3
 import sys
 import time
+from pathlib import Path
 
 import requests
 
@@ -84,11 +86,14 @@ import requests
 # Node 桥的地址。注意这里是 3456 不是 9333 ——
 # Python 只跟桥说话，桥自己去连 Chrome 的 9333，我们碰不到那个端口。
 RUNTIME_URL = "http://127.0.0.1:3456"
+DB_PATH = str(Path(__file__).with_name("boss_jobs.db"))  # 与发送脚本共用
+BROWSER_PAUSE_MIN = 1.0                 # 每条浏览器指令后的随机停顿（秒）
+BROWSER_PAUSE_MAX = 3.0
 
-KEYWORDS = ["Python开发"]                # 搜索关键词，可以多个
-CITIES = ["北京"]                        # 目标城市，可以多个
-MAX_PAGES = 2                            # 每个"城市×关键词"抓几页
-PAGE_SIZE = 30                           # 接口每页返回多少条
+KEYWORDS = ["AI大模型"]                # 搜索关键词，可以多个
+CITIES = ["深圳"]                        # 目标城市，可以多个
+MAX_PAGES = 5                            # 每个"城市×关键词"抓几页
+PAGE_SIZE = 20                           # 接口每页返回多少条 最多30条
 STRIP_WATERMARKS = True                  # 是否清洗 JD 里的投毒词，设 False 可看原文
 
 SEARCH_PAGE = "https://www.zhipin.com/web/geek/job"                      # 搜索页
@@ -126,6 +131,11 @@ def _get(path: str, params: dict | None = None, timeout: float = 30):
         return None
 
 
+def _browser_pause() -> None:
+    """浏览器动作之间随机停顿，降低连续机械操作的频率。"""
+    time.sleep(random.uniform(BROWSER_PAUSE_MIN, BROWSER_PAUSE_MAX))
+
+
 def new_tab(url: str) -> str | None:
     """开一个后台标签页，返回 targetId。
 
@@ -137,22 +147,26 @@ def new_tab(url: str) -> str | None:
     page 对象，后续每个操作都要把这串 id 带回给桥。
     """
     data = _get("/new", {"url": url, "background": "1"}, timeout=40)
+    _browser_pause()
     return data.get("targetId") if isinstance(data, dict) else None
 
 
 def navigate(target: str, url: str) -> None:
     """让已有标签页跳转到新 URL（复用标签页，不新开）。同样会等到加载完成。"""
     _get("/navigate", {"target": target, "url": url}, timeout=40)
+    _browser_pause()
 
 
 def close_tab(target: str) -> None:
     """关标签页。开了就要关，否则 Chrome 会越堆越多。"""
     _get("/close", {"target": target}, timeout=10)
+    _browser_pause()
 
 
 def scroll(target: str, y: int = 2000) -> None:
     """向下滚动 y 像素，触发懒加载。桥内部滚完会 sleep 800ms 等新内容渲染。"""
     _get("/scroll", {"target": target, "y": str(y)}, timeout=15)
+    _browser_pause()
 
 
 def evaluate(target: str, expression: str):
@@ -177,7 +191,9 @@ def evaluate(target: str, expression: str):
         )
         data = resp.json()
     except (requests.RequestException, ValueError):
+        _browser_pause()
         return None
+    _browser_pause()
 
     # JS 里抛了异常，桥会返回 {"error": "..."} + HTTP 400
     if data.get("error"):
@@ -450,12 +466,34 @@ def fetch_detail(url: str) -> dict:
 
 # ============================== 主流程 ==============================
 
+def job_identity(job: dict) -> tuple[str, str]:
+    """公司和职位都相同才算同一岗位；字段缺失时用岗位 ID 避免误合并。"""
+    company = str(job.get("company") or "").strip()
+    title = str(job.get("title") or "").strip()
+    if company and title:
+        return company, title
+    return "__job_id__", str(job.get("id") or job.get("url") or "")
+
+
+def load_existing_identities(db_path: str = DB_PATH) -> set[tuple[str, str]]:
+    """读取数据库已有的公司+职位组合，采集时直接跳过历史重复岗位。"""
+    if not Path(db_path).exists():
+        return set()
+    try:
+        with sqlite3.connect(db_path) as db:
+            rows = db.execute(
+                "SELECT company, title FROM jobs WHERE trim(company) != '' AND trim(title) != ''"
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {(str(company).strip(), str(title).strip()) for company, title in rows}
+
+
 def collect_keyword(city: str, city_code: str, keyword: str,
-                    seen: set[str], results: list[dict]) -> None:
+                    seen: set[tuple[str, str]], results: list[dict]) -> None:
     """抓一个"城市 × 关键词"组合的前 MAX_PAGES 页。
 
-    seen 和 results 是从上层传进来的，跨关键词共享，所以不同关键词搜到
-    同一个岗位只会记一次。
+    seen 和 results 从上层传入并跨关键词共享；公司和职位都相同才去重。
     """
     search_params = {"query": keyword, "city": city_code, "sortType": 2}
 
@@ -482,18 +520,27 @@ def collect_keyword(city: str, city_code: str, keyword: str,
                     navigate(target, build_url(SEARCH_PAGE, {**search_params, "page": page_no}))
                 rows, source = fetch_by_dom(target), "dom"
 
-            fresh = [r for r in rows if r["id"] not in seen]
+            fresh = []
+            for row in rows:
+                identity = job_identity(row)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                fresh.append(row)
             print(f"[{city}/{keyword}] 第 {page_no} 页({source}): {len(rows)} 条，新增 {len(fresh)} 条")
 
             if not rows:
                 break                # 这页真没数据，翻到底了
             if not fresh:
-                # 拿到数据但全是见过的 —— 说明 page 参数没生效，再翻也是白翻
-                print("  本页全是重复，翻页可能没生效，停止")
+                print("  本页岗位在数据库或本轮结果中均已存在，已跳过")
+                # API 的 page 参数可靠，继续检查下一页是否有新岗位；DOM 回退模式
+                # 无法可靠确认翻页是否生效，避免反复读取同一批数据。
+                if source == "api":
+                    time.sleep(random.uniform(3.0, 6.0))
+                    continue
                 break
 
             for row in fresh:
-                seen.add(row["id"])
                 time.sleep(random.uniform(2.0, 5.0))     # 详情页之间限速，别把账号刷进风控
 
                 detail = fetch_detail(row["url"])
@@ -536,13 +583,86 @@ def dump(results: list[dict]) -> None:
     print("\n" + "=" * 78)
 
 
+def save_to_sqlite(results: list[dict], db_path: str = DB_PATH) -> None:
+    """把采集结果写入 SQLite；重复采集只刷新岗位详情，不覆盖消息和发送状态。"""
+    with sqlite3.connect(db_path) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                company TEXT NOT NULL DEFAULT '',
+                salary TEXT NOT NULL DEFAULT '',
+                city TEXT NOT NULL DEFAULT '',
+                location TEXT NOT NULL DEFAULT '',
+                experience TEXT NOT NULL DEFAULT '',
+                education TEXT NOT NULL DEFAULT '',
+                boss TEXT NOT NULL DEFAULT '',
+                labels TEXT NOT NULL DEFAULT '',
+                jd TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'api',
+                greeting TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                sent_at TEXT
+            )
+        """)
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_company_title
+            ON jobs(company, title)
+            WHERE trim(company) != '' AND trim(title) != ''
+        """)
+        # 兼容上一版脚本写入的旧状态。
+        db.execute("UPDATE jobs SET status='pending' WHERE status='collected'")
+        for job in results:
+            existing = db.execute(
+                "SELECT id FROM jobs WHERE company = ? AND title = ? LIMIT 1",
+                (job["company"].strip(), job["title"].strip()),
+            ).fetchone()
+            if existing:
+                # 保留原记录 ID、pending/filter/sent 状态和发送历史，只刷新岗位详情。
+                db.execute("""
+                    UPDATE jobs SET
+                        salary=?, city=?, location=?, experience=?, education=?,
+                        boss=?, labels=?, jd=?, url=?, source=?, collected_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                """, (
+                    job["salary"], job["city"], job["location"], job["experience"],
+                    job["education"], job["boss"], job["labels"], job["jd"],
+                    job["url"], job["source"], existing[0],
+                ))
+                continue
+            db.execute("""
+                INSERT INTO jobs (
+                    id, title, company, salary, city, location, experience,
+                    education, boss, labels, jd, url, source, status, collected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title, company=excluded.company,
+                    salary=excluded.salary, city=excluded.city,
+                    location=excluded.location, experience=excluded.experience,
+                    education=excluded.education, boss=excluded.boss,
+                    labels=excluded.labels, jd=excluded.jd, url=excluded.url,
+                    source=excluded.source, collected_at=CURRENT_TIMESTAMP
+            """, (
+                job["id"], job["title"], job["company"], job["salary"],
+                job["city"], job["location"], job["experience"],
+                job["education"], job["boss"], job["labels"], job["jd"],
+                job["url"], job["source"],
+            ))
+    print(f"采集结果已保存到 {db_path}（{len(results)} 条）")
+
+
 def collect() -> None:
     """入口：自检 → 遍历所有城市×关键词 → 打印结果。"""
     require_runtime()
-    print("开始采集（结果只打印，不入库）...")
+    print(f"开始采集（结果将保存到 {DB_PATH}）...")
 
-    seen: set[str] = set()           # 已见过的岗位 id，跨城市跨关键词去重
+    seen = load_existing_identities()  # 数据库历史 + 本轮共享的公司/职位组合
     results: list[dict] = []         # 所有抓到的岗位，最后统一打印
+    print(f"数据库已有 {len(seen)} 个公司+职位组合，将自动跳过重复岗位")
 
     for city in CITIES:
         code = CITY_CODES.get(city)
@@ -552,6 +672,7 @@ def collect() -> None:
         for keyword in KEYWORDS:
             collect_keyword(city, code, keyword, seen, results)
 
+    save_to_sqlite(results)
     dump(results)
 
 
