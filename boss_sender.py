@@ -300,7 +300,7 @@ def send_pending_jobs(db, args):
     for index, row in enumerate(rows, 1):
         job = dict(row)
         job["greeting"] = greeting
-        print(f"[{index}/{len(rows)}] {job['company']} | {job['title']}")
+        print(f"[{index}/{len(rows)}] {job['company']} | {job['title']} | {job['salary']}")
         ok, detail = send_one(job)
         if ok:
             db.execute("UPDATE jobs SET status='sent', attempts=attempts+1, last_error='', sent_at=CURRENT_TIMESTAMP WHERE id=?", (job["id"],))
@@ -319,9 +319,9 @@ def build_parser():
     parser = argparse.ArgumentParser(description="向数据库中 pending 状态的 BOSS 岗位发送招呼语")
     parser.add_argument("--db", type=Path, default=Path(__file__).with_name("boss_jobs.db"))
     parser.add_argument("--message-file", type=Path, default=Path(__file__).with_name("greeting.txt"))
-    parser.add_argument("--limit", type=int, default=5, help="最多发送数量；把 default 改为 None 表示全部")
-    parser.add_argument("--interval-min", type=float, default=10.0, help="岗位之间最短等待秒数")
-    parser.add_argument("--interval-max", type=float, default=50.0, help="岗位之间最长等待秒数")
+    parser.add_argument("--limit", type=int, default=140, help="最多发送数量；把 default 改为 None 表示全部")
+    parser.add_argument("--interval-min", type=float, default=2.0, help="岗位之间最短等待秒数")
+    parser.add_argument("--interval-max", type=float, default=10.0, help="岗位之间最长等待秒数")
     parser.add_argument("--browser-pause-min", type=float, default=1.0, help="浏览器指令后最短等待秒数")
     parser.add_argument("--browser-pause-max", type=float, default=3.0, help="浏览器指令后最长等待秒数")
     parser.add_argument("--runtime-url", default="http://127.0.0.1:3456", help="CDP 桥地址")

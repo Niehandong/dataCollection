@@ -90,10 +90,10 @@ DB_PATH = str(Path(__file__).with_name("boss_jobs.db"))  # 与发送脚本共用
 BROWSER_PAUSE_MIN = 1.0                 # 每条浏览器指令后的随机停顿（秒）
 BROWSER_PAUSE_MAX = 3.0
 
-KEYWORDS = ["AI大模型"]                # 搜索关键词，可以多个
+KEYWORDS = ["AI开发工程师"]                # 搜索关键词，可以多个
 CITIES = ["深圳"]                        # 目标城市，可以多个
-MAX_PAGES = 5                            # 每个"城市×关键词"抓几页
-PAGE_SIZE = 20                           # 接口每页返回多少条 最多30条
+MAX_PAGES = 10                            # 每个"城市×关键词"抓几页
+PAGE_SIZE = 30                           # 接口每页返回多少条 最多30条
 STRIP_WATERMARKS = True                  # 是否清洗 JD 里的投毒词，设 False 可看原文
 
 SEARCH_PAGE = "https://www.zhipin.com/web/geek/job"                      # 搜索页
@@ -382,6 +382,88 @@ def detail_url_of(job_id: str, security_id: str = "") -> str:
     return build_url(base, {"lid": "", "securityId": security_id}) if security_id else base
 
 
+def parse_salary(salary: str) -> dict[str, int | float | None]:
+    """把薪资文本拆成便于数据库范围查询的数值字段，数值单位均为 K。"""
+    text = (salary or "").strip().upper().replace(" ", "")
+    match = re.search(
+        r"(?P<minimum>\d+(?:\.\d+)?)\s*-\s*(?P<maximum>\d+(?:\.\d+)?)K"
+        r"(?:[·*X](?P<months>\d+)薪)?",
+        text,
+    )
+    if not match:
+        return {
+            "salary_min_k": None, "salary_max_k": None, "salary_months": None,
+            "annual_salary_min_k": None, "annual_salary_max_k": None,
+        }
+
+    minimum = float(match.group("minimum"))
+    maximum = float(match.group("maximum"))
+    months = int(match.group("months") or 12)
+    minimum = int(minimum) if minimum.is_integer() else minimum
+    maximum = int(maximum) if maximum.is_integer() else maximum
+    return {
+        "salary_min_k": minimum,
+        "salary_max_k": maximum,
+        "salary_months": months,
+        "annual_salary_min_k": minimum * months,
+        "annual_salary_max_k": maximum * months,
+    }
+
+
+def ensure_schema_comments(db: sqlite3.Connection) -> None:
+    """用数据字典表保存 SQLite 原生不支持的表、字段及索引注释。"""
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS schema_comments (
+            object_type TEXT NOT NULL,
+            object_name TEXT NOT NULL,
+            column_name TEXT NOT NULL DEFAULT '',
+            comment TEXT NOT NULL,
+            PRIMARY KEY (object_type, object_name, column_name)
+        )
+    """)
+    comments = {
+        ("table", "jobs", ""): "BOSS 直聘岗位采集、筛选及发送状态记录",
+        ("column", "jobs", "id"): "岗位唯一标识",
+        ("column", "jobs", "title"): "岗位名称",
+        ("column", "jobs", "company"): "公司名称",
+        ("column", "jobs", "salary"): "平台展示的原始薪资文本",
+        ("column", "jobs", "salary_min_k"): "月薪下限，单位：千元",
+        ("column", "jobs", "salary_max_k"): "月薪上限，单位：千元",
+        ("column", "jobs", "salary_months"): "全年发薪月数，未标注时按 12 计算",
+        ("column", "jobs", "annual_salary_min_k"): "年薪下限，单位：千元",
+        ("column", "jobs", "annual_salary_max_k"): "年薪上限，单位：千元",
+        ("column", "jobs", "city"): "岗位所在城市",
+        ("column", "jobs", "location"): "岗位详细区域或商圈",
+        ("column", "jobs", "experience"): "工作经验要求",
+        ("column", "jobs", "education"): "学历要求",
+        ("column", "jobs", "boss"): "招聘者姓名及职位",
+        ("column", "jobs", "labels"): "岗位标签及技能关键词",
+        ("column", "jobs", "jd"): "岗位职责与任职要求全文",
+        ("column", "jobs", "url"): "岗位详情页地址",
+        ("column", "jobs", "source"): "采集来源：api 或 dom",
+        ("column", "jobs", "greeting"): "向招聘者发送的招呼语",
+        ("column", "jobs", "status"): "处理状态，如 pending、filtered、sent",
+        ("column", "jobs", "attempts"): "招呼语发送尝试次数",
+        ("column", "jobs", "last_error"): "最近一次处理失败信息",
+        ("column", "jobs", "collected_at"): "岗位最近采集或刷新时间",
+        ("column", "jobs", "sent_at"): "招呼语成功发送时间",
+        ("index", "ux_jobs_company_title", ""): "公司名称与岗位名称非空时唯一，防止重复采集",
+        ("index", "ix_jobs_salary_range", ""): "加速月薪上下限范围查询",
+        ("index", "ix_jobs_annual_salary_range", ""): "加速年薪上下限范围查询",
+        ("table", "schema_comments", ""): "SQLite 数据库对象中文注释的数据字典",
+        ("column", "schema_comments", "object_type"): "对象类型：table、column 或 index",
+        ("column", "schema_comments", "object_name"): "表名或索引名",
+        ("column", "schema_comments", "column_name"): "字段名；表和索引注释为空字符串",
+        ("column", "schema_comments", "comment"): "对象的中文说明",
+    }
+    db.executemany("""
+        INSERT INTO schema_comments (object_type, object_name, column_name, comment)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(object_type, object_name, column_name)
+        DO UPDATE SET comment=excluded.comment
+    """, ((*key, comment) for key, comment in comments.items()))
+
+
 # ==================== 第三层：列表抓取（两条路） ====================
 
 def fetch_by_api(target: str, keyword: str, city_code: str, page_no: int) -> list[dict] | None:
@@ -592,6 +674,11 @@ def save_to_sqlite(results: list[dict], db_path: str = DB_PATH) -> None:
                 title TEXT NOT NULL DEFAULT '',
                 company TEXT NOT NULL DEFAULT '',
                 salary TEXT NOT NULL DEFAULT '',
+                salary_min_k REAL,
+                salary_max_k REAL,
+                salary_months INTEGER,
+                annual_salary_min_k REAL,
+                annual_salary_max_k REAL,
                 city TEXT NOT NULL DEFAULT '',
                 location TEXT NOT NULL DEFAULT '',
                 experience TEXT NOT NULL DEFAULT '',
@@ -609,6 +696,25 @@ def save_to_sqlite(results: list[dict], db_path: str = DB_PATH) -> None:
                 sent_at TEXT
             )
         """)
+        # 自动迁移已有数据库，并回填历史岗位的结构化薪资。
+        existing_columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+        salary_columns = {
+            "salary_min_k": "REAL", "salary_max_k": "REAL",
+            "salary_months": "INTEGER", "annual_salary_min_k": "REAL",
+            "annual_salary_max_k": "REAL",
+        }
+        for column, column_type in salary_columns.items():
+            if column not in existing_columns:
+                db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {column_type}")
+        for job_id, salary in db.execute("SELECT id, salary FROM jobs").fetchall():
+            parsed = parse_salary(salary)
+            db.execute("""
+                UPDATE jobs SET salary_min_k=?, salary_max_k=?, salary_months=?,
+                    annual_salary_min_k=?, annual_salary_max_k=? WHERE id=?
+            """, (*parsed.values(), job_id))
+        db.execute("CREATE INDEX IF NOT EXISTS ix_jobs_salary_range ON jobs(salary_min_k, salary_max_k)")
+        db.execute("CREATE INDEX IF NOT EXISTS ix_jobs_annual_salary_range ON jobs(annual_salary_min_k, annual_salary_max_k)")
+        ensure_schema_comments(db)
         db.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_company_title
             ON jobs(company, title)
@@ -617,6 +723,7 @@ def save_to_sqlite(results: list[dict], db_path: str = DB_PATH) -> None:
         # 兼容上一版脚本写入的旧状态。
         db.execute("UPDATE jobs SET status='pending' WHERE status='collected'")
         for job in results:
+            parsed_salary = parse_salary(job["salary"])
             existing = db.execute(
                 "SELECT id FROM jobs WHERE company = ? AND title = ? LIMIT 1",
                 (job["company"].strip(), job["title"].strip()),
@@ -625,29 +732,37 @@ def save_to_sqlite(results: list[dict], db_path: str = DB_PATH) -> None:
                 # 保留原记录 ID、pending/filter/sent 状态和发送历史，只刷新岗位详情。
                 db.execute("""
                     UPDATE jobs SET
-                        salary=?, city=?, location=?, experience=?, education=?,
+                        salary=?, salary_min_k=?, salary_max_k=?, salary_months=?,
+                        annual_salary_min_k=?, annual_salary_max_k=?,
+                        city=?, location=?, experience=?, education=?,
                         boss=?, labels=?, jd=?, url=?, source=?, collected_at=CURRENT_TIMESTAMP
                     WHERE id=?
                 """, (
-                    job["salary"], job["city"], job["location"], job["experience"],
+                    job["salary"], *parsed_salary.values(),
+                    job["city"], job["location"], job["experience"],
                     job["education"], job["boss"], job["labels"], job["jd"],
                     job["url"], job["source"], existing[0],
                 ))
                 continue
             db.execute("""
                 INSERT INTO jobs (
-                    id, title, company, salary, city, location, experience,
+                    id, title, company, salary, salary_min_k, salary_max_k,
+                    salary_months, annual_salary_min_k, annual_salary_max_k,
+                    city, location, experience,
                     education, boss, labels, jd, url, source, status, collected_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
                 ON CONFLICT(id) DO UPDATE SET
                     title=excluded.title, company=excluded.company,
-                    salary=excluded.salary, city=excluded.city,
+                    salary=excluded.salary, salary_min_k=excluded.salary_min_k,
+                    salary_max_k=excluded.salary_max_k, salary_months=excluded.salary_months,
+                    annual_salary_min_k=excluded.annual_salary_min_k,
+                    annual_salary_max_k=excluded.annual_salary_max_k, city=excluded.city,
                     location=excluded.location, experience=excluded.experience,
                     education=excluded.education, boss=excluded.boss,
                     labels=excluded.labels, jd=excluded.jd, url=excluded.url,
                     source=excluded.source, collected_at=CURRENT_TIMESTAMP
             """, (
-                job["id"], job["title"], job["company"], job["salary"],
+                job["id"], job["title"], job["company"], job["salary"], *parsed_salary.values(),
                 job["city"], job["location"], job["experience"],
                 job["education"], job["boss"], job["labels"], job["jd"],
                 job["url"], job["source"],
